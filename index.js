@@ -1,5 +1,4 @@
 import { ethers } from "ethers";
-import { createClient } from "@supabase/supabase-js";
 
 /* ═══════════════════════════════════════════════════════════════════════════
    leveraged.lol — trade indexer
@@ -21,11 +20,21 @@ import { createClient } from "@supabase/supabase-js";
 
 const RPC     = process.env.RPC_URL;
 const FACTORY = process.env.FACTORY_ADDRESS;
-const SB_URL  = process.env.SUPABASE_URL;
-const SB_KEY  = process.env.SUPABASE_SERVICE_KEY;
+const SB_URL  = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+
+/* Pasting a long key into a dashboard field often introduces a line break, and
+   a header containing one is rejected outright with an error that names the
+   key rather than the cause. Strip all whitespace rather than letting that
+   happen every write. */
+const SB_KEY = (process.env.SUPABASE_SERVICE_KEY || "").replace(/\s+/g, "");
 
 if (!RPC || !FACTORY || !SB_URL || !SB_KEY) {
   console.error("Missing RPC_URL, FACTORY_ADDRESS, SUPABASE_URL or SUPABASE_SERVICE_KEY");
+  process.exit(1);
+}
+if (!/^sb_secret_|^eyJ/.test(SB_KEY)) {
+  console.error("SUPABASE_SERVICE_KEY does not look like a secret key. It should");
+  console.error("start with sb_secret_ . The publishable key cannot write.");
   process.exit(1);
 }
 
@@ -46,7 +55,35 @@ const POOL_ABI = [
 
 const provider = new ethers.JsonRpcProvider(RPC);
 const factory  = new ethers.Contract(FACTORY, FAC_ABI, provider);
-const db       = createClient(SB_URL, SB_KEY, { auth: { persistSession: false } });
+
+/* Plain fetch against PostgREST rather than the supabase-js client. The client
+   pulls in a realtime websocket layer that refuses to start on Node 20, and
+   this worker only ever does two things: upsert rows and read one column. Not
+   worth a dependency, and one less thing to break on a runtime upgrade. */
+const sbHeaders = {
+  apikey: SB_KEY,
+  Authorization: `Bearer ${SB_KEY}`,
+  "Content-Type": "application/json",
+};
+
+async function sbSelect(path) {
+  const r = await fetch(`${SB_URL}/rest/v1/${path}`, { headers: sbHeaders });
+  if (!r.ok) throw new Error(`select ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+/** Upsert. `onConflict` names the primary key columns. */
+async function sbUpsert(table, rows, onConflict, ignoreDuplicates = false) {
+  const r = await fetch(`${SB_URL}/rest/v1/${table}?on_conflict=${onConflict}`, {
+    method: "POST",
+    headers: {
+      ...sbHeaders,
+      Prefer: `resolution=${ignoreDuplicates ? "ignore" : "merge"}-duplicates,return=minimal`,
+    },
+    body: JSON.stringify(rows),
+  });
+  if (!r.ok) throw new Error(`upsert ${r.status}: ${await r.text()}`);
+}
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -90,10 +127,11 @@ async function listPools() {
 }
 
 async function indexPool({ pool, createdAt }, head) {
-  const { data: st } = await db.from("index_state")
-    .select("last_block").eq("pool", pool).maybeSingle();
+  const st = await sbSelect(
+    `index_state?pool=eq.${pool}&select=last_block&limit=1`);
+  const last = st[0]?.last_block;
 
-  let from = st?.last_block ? st.last_block + 1 : await blockAtTime(createdAt);
+  let from = last ? Number(last) + 1 : await blockAtTime(createdAt);
   if (from > head) return 0;
 
   const c = new ethers.Contract(pool, POOL_ABI, provider);
@@ -137,15 +175,14 @@ async function indexPool({ pool, createdAt }, head) {
   if (rows.length) {
     // Upsert rather than insert: a pass can overlap a previous one after a
     // crash, and the primary key makes that a no-op instead of a duplicate.
-    const { error } = await db.from("swaps").upsert(rows, {
-      onConflict: "pool,block,log_index", ignoreDuplicates: true,
-    });
-    if (error) { log(`  ${pool}: write failed, ${error.message}`); return 0; }
+    // Chunked because a long backfill can produce thousands of rows at once.
+    for (let i = 0; i < rows.length; i += 500) {
+      await sbUpsert("swaps", rows.slice(i, i + 500), "pool,block,log_index", true);
+    }
   }
 
-  await db.from("index_state").upsert(
-    { pool, last_block: reached, updated_at: new Date().toISOString() },
-    { onConflict: "pool" });
+  await sbUpsert("index_state",
+    [{ pool, last_block: reached, updated_at: new Date().toISOString() }], "pool");
 
   return rows.length;
 }
